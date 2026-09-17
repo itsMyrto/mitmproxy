@@ -390,24 +390,24 @@ class HttpStream(layer.Layer):
                 if not ok:
                     return
 
-                content = self.flow.request.raw_content
-                done_after_headers = not (content or self.flow.request.trailers)
-                yield SendHttp(
-                    RequestHeaders(
-                        self.stream_id, self.flow.request, done_after_headers
-                    ),
-                    self.context.server,
-                )
-                if content:
-                    yield SendHttp(
-                        RequestData(self.stream_id, content), self.context.server
-                    )
-                if self.flow.request.trailers:
-                    yield SendHttp(
-                        RequestTrailers(self.stream_id, self.flow.request.trailers),
-                        self.context.server,
-                    )
-                yield SendHttp(RequestEndOfMessage(self.stream_id), self.context.server)
+                yield from self.send_buffered_request()
+
+    def send_buffered_request(self) -> layer.CommandGenerator[None]:
+        """Hand a fully buffered request to the server."""
+        content = self.flow.request.raw_content
+        done_after_headers = not (content or self.flow.request.trailers)
+        yield SendHttp(
+            RequestHeaders(self.stream_id, self.flow.request, done_after_headers),
+            self.context.server,
+        )
+        if content:
+            yield SendHttp(RequestData(self.stream_id, content), self.context.server)
+        if self.flow.request.trailers:
+            yield SendHttp(
+                RequestTrailers(self.stream_id, self.flow.request.trailers),
+                self.context.server,
+            )
+        yield SendHttp(RequestEndOfMessage(self.stream_id), self.context.server)
 
     @expect(ResponseHeaders)
     def state_wait_for_response_headers(
