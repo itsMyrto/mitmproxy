@@ -120,10 +120,15 @@ class Http2Connection(HttpConnection):
         else:
             return False
 
+    def _flush(self) -> CommandGenerator[None]:
+        """Send any pending hyper-h2 output to the transport."""
+        if data := self.h2_conn.data_to_send():
+            yield SendData(self.conn, data)
+
     def _handle_event(self, event: Event) -> CommandGenerator[None]:
         if isinstance(event, Start):
             self.h2_conn.initiate_connection()
-            yield SendData(self.conn, self.h2_conn.data_to_send())
+            yield from self._flush()
 
         elif isinstance(event, HttpEvent):
             if isinstance(event, (RequestData, ResponseData)):
@@ -187,9 +192,7 @@ class Http2Connection(HttpConnection):
                         self.h2_conn.reset_stream(event.stream_id, error_code.value)
             else:
                 raise AssertionError(f"Unexpected event: {event}")
-            data_to_send = self.h2_conn.data_to_send()
-            if data_to_send:
-                yield SendData(self.conn, data_to_send)
+            yield from self._flush()
 
         elif isinstance(event, DataReceived):
             try:
@@ -213,9 +216,7 @@ class Http2Connection(HttpConnection):
                         yield Log(f"{self.debug}[h2] done", DEBUG)
                     return
 
-            data_to_send = self.h2_conn.data_to_send()
-            if data_to_send:
-                yield SendData(self.conn, data_to_send)
+            yield from self._flush()
 
         elif isinstance(event, ConnectionClosed):
             yield from self.close_connection("peer closed connection")
@@ -318,7 +319,7 @@ class Http2Connection(HttpConnection):
     ) -> CommandGenerator[None]:
         yield Log(f"{human.format_address(self.conn.peername)}: {message}")
         self.h2_conn.close_connection(error_code, message.encode())
-        yield SendData(self.conn, self.h2_conn.data_to_send())
+        yield from self._flush()
         yield from self.close_connection(message)
 
     def close_connection(self, msg: str) -> CommandGenerator[None]:
@@ -427,7 +428,7 @@ class Http2Server(Http2Connection):
                     ),
                     end_stream=event.end_stream,
                 )
-                yield SendData(self.conn, self.h2_conn.data_to_send())
+                yield from self._flush()
         else:
             yield from super()._handle_event(event)
 
@@ -573,7 +574,7 @@ class Http2Client(Http2Connection):
                 end_stream=event.end_stream,
             )
             self.streams[event.stream_id] = StreamState.EXPECTING_HEADERS
-            yield SendData(self.conn, self.h2_conn.data_to_send())
+            yield from self._flush()
         else:
             yield from super()._handle_event(event)
 
