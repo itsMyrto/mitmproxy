@@ -26,6 +26,31 @@ errors. Protocol violations are often deliberately forwarded or inserted at the 
 HTTP/2 support in mitmproxy is based on [hyper-h2](https://github.com/python-hyper/hyper-h2). In case the upstream
 server does not speak HTTP/2, mitmproxy seamlessly translates messages to HTTP/1.
 
+##### Coordinated Release
+
+Addons can have a group of requests completed at the same moment, so that the server sees
+them all become processable together rather than milliseconds apart. This is useful for
+testing how a server handles genuinely concurrent requests.
+
+An addon marks each participating flow:
+
+```python
+flow.metadata["race_group"] = {"id": "checkout", "expected": 3}
+```
+
+mitmproxy then sends each member's headers and body as usual, but withholds the frame that
+ends the stream. Once every member of the group is ready, all of their completions are
+written at once. A worked example is in `examples/addons/http2-race-group.py`.
+
+Every member must share one upstream HTTP/2 connection, so they must have the same
+destination, and a group may not be larger than that connection's concurrent stream limit.
+Requests that carry trailers or that are being streamed cannot take part. Anything that
+cannot be honoured is logged and the request is sent normally, so a declaration never
+changes whether a request is delivered -- only when it completes.
+
+If a group is still incomplete after `race_group_timeout` seconds (10 by default), the
+members held so far are sent without being raced.
+
 ##### Known Limitations
 
 - *Priority Information*: mitmproxy currently ignores HTTP/2 PRIORITY frames. This does not affect the transmitted
