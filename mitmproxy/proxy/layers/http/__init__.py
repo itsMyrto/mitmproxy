@@ -43,6 +43,9 @@ from ._http2 import Http2Client
 from ._http2 import Http2Server
 from ._http3 import Http3Client
 from ._http3 import Http3Server
+from ._race import RaceGroupError
+from ._race import RaceGroupSpec
+from ._race import spec_from_metadata
 from mitmproxy import flow
 from mitmproxy import http
 from mitmproxy.connection import Connection
@@ -302,6 +305,9 @@ class HttpStream(layer.Layer):
         if not ok:
             self.client_state = self.state_errored
             return
+        # Streaming cannot take part in a race, but a declaration must not pass
+        # unremarked -- the helper logs why it is being ignored.
+        yield from self.race_group_for_request()
         yield SendHttp(
             RequestHeaders(self.stream_id, self.flow.request, end_stream=False),
             self.context.server,
@@ -392,12 +398,40 @@ class HttpStream(layer.Layer):
 
                 yield from self.send_buffered_request()
 
+    def race_group_for_request(self) -> layer.CommandGenerator[RaceGroupSpec | None]:
+        """Read an addon's race group declaration, explaining any reason it cannot hold."""
+        try:
+            spec = spec_from_metadata(self.flow.metadata)
+        except RaceGroupError as e:
+            # A malformed declaration must never break the request it rides on.
+            yield commands.Log(f"Ignoring race group declaration: {e}", WARNING)
+            return None
+        if spec is None:
+            return None
+
+        if self.context.server.alpn != b"h2":
+            reason = "coordinated release needs an HTTP/2 upstream connection"
+        elif self.flow.request.trailers:
+            reason = "a request with trailers cannot have its completion withheld"
+        elif self.flow.request.stream:
+            reason = "a streamed request cannot have its completion withheld"
+        else:
+            return spec
+        yield commands.Log(f"Ignoring race group {spec.id!r}: {reason}.", WARNING)
+        return None
+
     def send_buffered_request(self) -> layer.CommandGenerator[None]:
         """Hand a fully buffered request to the server."""
+        race_group = yield from self.race_group_for_request()
         content = self.flow.request.raw_content
         done_after_headers = not (content or self.flow.request.trailers)
         yield SendHttp(
-            RequestHeaders(self.stream_id, self.flow.request, done_after_headers),
+            RequestHeaders(
+                self.stream_id,
+                self.flow.request,
+                done_after_headers,
+                race_group=race_group,
+            ),
             self.context.server,
         )
         if content:

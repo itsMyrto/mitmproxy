@@ -4,6 +4,7 @@ from collections.abc import Sequence
 from enum import Enum
 from logging import DEBUG
 from logging import ERROR
+from logging import WARNING
 from typing import Any
 from typing import assert_never
 from typing import ClassVar
@@ -46,6 +47,11 @@ from ._base import HttpEvent
 from ._base import ReceiveHttp
 from ._http_h2 import BufferedH2Connection
 from ._http_h2 import H2ConnectionLogger
+from ._race import MemberState
+from ._race import RaceGroup
+from ._race import RaceGroupError
+from ._race import RaceGroupSpec
+from ._race import RaceRegistry
 from mitmproxy import http
 from mitmproxy import version
 from mitmproxy.connection import Connection
@@ -74,6 +80,8 @@ class Http2Connection(HttpConnection):
     h2_conn: BufferedH2Connection
     streams: dict[int, StreamState]
     """keep track of all active stream ids to send protocol errors on teardown"""
+    race_groups: RaceRegistry
+    """streams whose completions are held back to be released together"""
 
     ReceiveProtocolError: type[RequestProtocolError | ResponseProtocolError]
     ReceiveData: type[RequestData | ResponseData]
@@ -91,6 +99,7 @@ class Http2Connection(HttpConnection):
         )
         self.h2_conn = BufferedH2Connection(self.h2_conf)
         self.streams = {}
+        self.race_groups = RaceRegistry()
 
     def is_closed(self, stream_id: int) -> bool:
         """Check if a non-idle stream is closed"""
@@ -251,6 +260,10 @@ class Http2Connection(HttpConnection):
             if self.is_closed(event.stream_id):
                 self.streams.pop(event.stream_id, None)
         elif isinstance(event, h2.events.StreamReset):
+            # A reset member leaves its group unsatisfiable rather than short,
+            # so a barrier fails loudly instead of waiting for a stream that
+            # will never arrive.
+            self.race_groups.lose(event.stream_id)
             if event.stream_id in self.streams:
                 try:
                     err_str = h2.errors.ErrorCodes(event.error_code).name
@@ -277,6 +290,7 @@ class Http2Connection(HttpConnection):
             yield from self.protocol_error(f"HTTP/2 protocol error: {event}")
             return True
         elif isinstance(event, h2.events.ConnectionTerminated):
+            self.race_groups.clear()
             yield from self.close_connection(f"HTTP/2 connection closed: {event!r}")
             return True
             # The implementation above isn't really ideal, we should probably only terminate streams > last_stream_id?
@@ -491,6 +505,8 @@ class Http2Client(Http2Connection):
     """A provisional currency limit before we get the server's first settings frame."""
     last_activity: float
     """Timestamp of when we've last seen network activity on this connection."""
+    _race_deadlines: dict[RequestWakeup, RaceGroup]
+    """Live race group deadlines, keyed by the wakeup that will fire them."""
 
     def __init__(self, context: Context):
         super().__init__(context, context.server)
@@ -502,6 +518,7 @@ class Http2Client(Http2Connection):
         self.our_stream_id = {}
         self.their_stream_id = {}
         self.stream_queue = collections.defaultdict(list)
+        self._race_deadlines = {}
 
     def _handle_event(self, event: Event) -> CommandGenerator[None]:
         # We can't reuse stream ids from the client because they may arrived reordered here
@@ -521,6 +538,10 @@ class Http2Client(Http2Connection):
                 self.our_stream_id[event.stream_id] = ours
                 self.their_stream_id[ours] = event.stream_id
             event.stream_id = ours
+            if isinstance(event, RequestHeaders) and event.race_group is not None:
+                # Registered here rather than in HttpStream because this is where
+                # the upstream stream id -- the one h2 actually sends on -- exists.
+                yield from self.register_race_member(event.stream_id, event.race_group)
 
         for cmd in self._handle_event2(event):
             if isinstance(cmd, ReceiveHttp):
@@ -537,7 +558,136 @@ class Http2Client(Http2Connection):
             for event in events:
                 yield from self._handle_event(event)
 
+    def register_race_member(
+        self, stream_id: int, spec: RaceGroupSpec
+    ) -> CommandGenerator[None]:
+        """Add a stream to its declared race group, or log why it cannot take part."""
+        # This guard covers a group declared while the connection has room. A group
+        # that straddles saturation escapes it: once the connection is full,
+        # _handle_event parks the event in stream_queue and returns before reaching
+        # here, so those members are neither checked nor registered. Such a group
+        # simply never arms and is released by its timeout, which then frees the
+        # slots. Bounding that properly means checking above the queueing branch.
+        limit = (
+            self.provisional_max_concurrency
+            or self.h2_conn.remote_settings.max_concurrent_streams
+        )
+        # Members already registered are counted in open_outbound_streams, so add
+        # them back: what matters is how many slots the whole group can claim.
+        group = self.race_groups.group(spec.id)
+        already = len(group.members) if group is not None else 0
+        available = limit - self.h2_conn.open_outbound_streams + already
+        if spec.expected > available:
+            # Otherwise the members that do fit hold the connection at capacity
+            # while the rest sit in stream_queue waiting for a slot that only the
+            # group's own release can free.
+            yield Log(
+                f"Ignoring race group {spec.id!r}: {spec.expected} members exceed "
+                f"the {available} of {limit} concurrent streams still free.",
+                WARNING,
+            )
+            return
+        try:
+            self.race_groups.register(stream_id, spec.id, spec.expected)
+        except RaceGroupError as e:
+            yield Log(f"Ignoring race group {spec.id!r}: {e}", WARNING)
+
+    def race_members_ready(self, group: RaceGroup) -> bool:
+        """Check that every member's completion would really go out on the next write."""
+        # A stream with data still buffered behind flow control swallows its
+        # completion into that buffer instead of serialising it, which would
+        # drop the member from the release without any error.
+        return not any(
+            self.h2_conn.stream_buffers.get(stream_id)
+            or stream_id in self.h2_conn.stream_trailers
+            for stream_id in group.members
+        )
+
+    def _complete_race_members(self, group: RaceGroup, stream_ids: list[int]) -> None:
+        """End the given streams and retire the group."""
+        for stream_id in stream_ids:
+            if self.is_open_for_us(stream_id):
+                self.h2_conn.end_stream(stream_id)
+        group.released = True
+        self.race_groups.finish(group.id)
+        # The deadline entry is deliberately left in place: its wakeup is already
+        # scheduled and cannot be unscheduled, so it has to stay recognisable.
+        # When it fires, the released check below turns it into a no-op that pops
+        # itself. Dropping it here would send it to the ping keepalive branch,
+        # which would then reschedule it forever.
+
+    def release_race_group(self, group: RaceGroup) -> CommandGenerator[None]:
+        """Complete every member of an armed group so they leave in a single write."""
+        yield Log(
+            f"Releasing race group {group.id!r}: {group.expected} members.", DEBUG
+        )
+        self._complete_race_members(group, list(group.members))
+
+    def fail_race_group(self, group: RaceGroup, reason: str) -> CommandGenerator[None]:
+        """Release a group's held members without racing them, and say why."""
+        staged = [
+            stream_id
+            for stream_id, state in group.members.items()
+            if state is MemberState.STAGED
+        ]
+        lost = sum(1 for state in group.members.values() if state is MemberState.LOST)
+        # A member behind flow control is released into its own buffer rather than
+        # into this write, so say so instead of implying it went out.
+        queued = sum(
+            1
+            for stream_id in staged
+            if self.h2_conn.stream_buffers.get(stream_id)
+            or stream_id in self.h2_conn.stream_trailers
+        )
+        detail = f", {lost} lost to a stream reset" if lost else ""
+        if queued:
+            detail += f", {queued} still queued behind flow control"
+        yield Log(
+            f"Race group {group.id!r} {reason}. Releasing "
+            f"{len(staged)}/{group.expected} held members un-raced{detail}.",
+            WARNING,
+        )
+        self._complete_race_members(group, staged)
+
+    def stage_race_member(self, stream_id: int) -> CommandGenerator[None]:
+        """Withhold a member's completion until its whole group is ready to go."""
+        try:
+            group = self.race_groups.stage(stream_id)
+        except RaceGroupError as e:
+            # Never let bookkeeping take the connection down: send it un-raced.
+            yield Log(f"Race group: {e}; sending this request un-raced.", WARNING)
+            if self.is_open_for_us(stream_id):
+                self.h2_conn.end_stream(stream_id)
+            return
+        if not any(live is group for live in self._race_deadlines.values()):
+            # The clock starts when we first hold something back. Counting staged
+            # members would restart it whenever one is lost, arming a second one.
+            timeout = self.context.options.race_group_timeout
+            if timeout > 0:
+                wakeup = RequestWakeup(timeout)
+                self._race_deadlines[wakeup] = group
+                yield wakeup
+
+        if group.is_failed:
+            yield from self.fail_race_group(group, "lost a member")
+        elif not group.is_armed:
+            pass  # still waiting for the rest of the group
+        elif self.race_members_ready(group):
+            yield from self.release_race_group(group)
+        else:
+            yield from self.fail_race_group(group, "cannot be released in one write")
+
     def _handle_event2(self, event: Event) -> CommandGenerator[None]:
+        if isinstance(event, Wakeup) and event.command in self._race_deadlines:
+            group = self._race_deadlines.pop(event.command)
+            if not group.released:
+                yield from self.fail_race_group(
+                    group,
+                    f"timed out after {self.context.options.race_group_timeout}s -- "
+                    f"the rest either never arrived or went to another connection",
+                )
+                yield from self._flush()
+            return
         if isinstance(event, Wakeup):
             send_ping_now = (
                 # add one second to avoid unnecessary roundtrip, we don't need to be super correct here.
@@ -568,12 +718,24 @@ class Http2Client(Http2Connection):
                 yield RequestWakeup(self.context.options.http2_ping_keepalive)
             yield from super()._handle_event(event)
         elif isinstance(event, RequestHeaders):
+            # A race member needs a completion frame of its own to withhold, so it
+            # must not carry END_STREAM on its headers even when it has no body.
+            is_member = self.race_groups.group_for(event.stream_id) is not None
             self.h2_conn.send_headers(
                 event.stream_id,
                 headers=(yield from format_h2_request_headers(self.context, event)),
-                end_stream=event.end_stream,
+                end_stream=event.end_stream and not is_member,
             )
             self.streams[event.stream_id] = StreamState.EXPECTING_HEADERS
+            yield from self._flush()
+        elif (
+            isinstance(event, RequestEndOfMessage)
+            and self.is_open_for_us(event.stream_id)
+            and self.race_groups.group_for(event.stream_id) is not None
+        ):
+            yield from self.stage_race_member(event.stream_id)
+            # When this staging arms the group, the release happens above and this
+            # single flush is what puts every member's completion in one write.
             yield from self._flush()
         else:
             yield from super()._handle_event(event)

@@ -1135,7 +1135,7 @@ class TestClient:
             >> http.RequestHeaders(1, req, end_stream=False)
             << commands.Log(
                 "Received RequestHeaders(stream_id=0, request=Request(GET example.com:80/),"
-                " end_stream=False, replay_flow=None) unexpectedly: "
+                " end_stream=False, replay_flow=None, race_group=None) unexpectedly: "
                 "initial HEADERS frame is not allowed in this state"
             )
         )

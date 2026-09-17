@@ -48,6 +48,7 @@ export interface OptionsState {
     protobuf_definitions: string | undefined;
     proxy_debug: boolean;
     proxyauth: string | undefined;
+    race_group_timeout: number;
     rawtcp: boolean;
     readfile_filter: string | undefined;
     request_client_cert: boolean;
@@ -156,6 +157,7 @@ export const defaultState: OptionsState = {
     protobuf_definitions: undefined,
     proxy_debug: false,
     proxyauth: undefined,
+    race_group_timeout: 10,
     rawtcp: true,
     readfile_filter: undefined,
     request_client_cert: false,

@@ -1,13 +1,33 @@
-"""Unit tests for the HTTP/2 race group state machine."""
+from logging import WARNING
 
+import hyperframe.frame
 import pytest
 
+from mitmproxy.http import Headers
+from mitmproxy.http import HTTPFlow
+from mitmproxy.http import Request
 from mitmproxy.io import tnetstring
+from mitmproxy.proxy.commands import Log
+from mitmproxy.proxy.commands import RequestWakeup
+from mitmproxy.proxy.commands import SendData
+from mitmproxy.proxy.events import DataReceived
+from mitmproxy.proxy.layers.http import HttpStream
+from mitmproxy.proxy.layers.http import RequestData
+from mitmproxy.proxy.layers.http import RequestEndOfMessage
+from mitmproxy.proxy.layers.http import RequestHeaders
+from mitmproxy.proxy.layers.http import ResponseProtocolError
+from mitmproxy.proxy.layers.http import SendHttp
+from mitmproxy.proxy.layers.http._base import ReceiveHttp
+from mitmproxy.proxy.layers.http._http2 import Http2Client
 from mitmproxy.proxy.layers.http._race import MemberState
 from mitmproxy.proxy.layers.http._race import RaceGroupError
 from mitmproxy.proxy.layers.http._race import RaceGroupSpec
 from mitmproxy.proxy.layers.http._race import RaceRegistry
 from mitmproxy.proxy.layers.http._race import spec_from_metadata
+from test.mitmproxy.proxy.layers.http.test_http2 import decode_frames
+from test.mitmproxy.proxy.tutils import Placeholder
+from test.mitmproxy.proxy.tutils import Playbook
+from test.mitmproxy.proxy.tutils import reply
 
 
 def test_register_creates_group_with_pending_member():
@@ -223,3 +243,383 @@ def test_spec_from_metadata_rejects_a_malformed_declaration(declaration):
     """Test that a malformed declaration is reported rather than half-read."""
     with pytest.raises(RaceGroupError):
         spec_from_metadata({"race_group": declaration})
+
+
+def test_register_race_member_registers_the_upstream_stream_id(tctx):
+    """Test that a declared member is registered under the id h2 will send on."""
+    client = Http2Client(tctx)
+    assert list(client.register_race_member(5, RaceGroupSpec("coupons", 2))) == []
+
+    group = client.race_groups.group_for(5)
+    assert group is not None
+    assert group.id == "coupons"
+    assert group.members == {5: MemberState.PENDING}
+
+
+def test_register_race_member_refuses_a_group_over_the_concurrency_limit(tctx):
+    """Test that a group larger than the connection allows is declined, not queued."""
+    client = Http2Client(tctx)
+    oversized = client.provisional_max_concurrency + 1
+
+    logs = list(client.register_race_member(1, RaceGroupSpec("coupons", oversized)))
+
+    assert len(logs) == 1
+    assert "exceed" in logs[0].message
+    assert client.race_groups.group_for(1) is None
+
+
+def _race_playbook(tctx, spec, members=3):
+    """Drive an h2 client up to the point where every member has sent its headers."""
+    tctx.options.http2_ping_keepalive = 0
+    tctx.server.alpn = b"h2"
+    playbook = Playbook(Http2Client(tctx), hooks=False)
+    req = Request.make("GET", "http://example.com/")
+    headers = [Placeholder(bytes) for _ in range(members)]
+
+    playbook << SendData(tctx.server, Placeholder(bytes))  # preamble + settings
+    for i in range(members):
+        playbook >> RequestHeaders(i + 1, req, end_stream=True, race_group=spec)
+        playbook << SendData(tctx.server, headers[i])
+    return playbook, headers
+
+
+def test_race_member_headers_do_not_carry_end_stream(tctx):
+    """Test that a member keeps a completion frame of its own to withhold."""
+    # A bodyless request would normally finish on its headers, leaving nothing to
+    # hold back, so END_STREAM has to be forced off for group members.
+    playbook, headers = _race_playbook(tctx, RaceGroupSpec("coupons", 3))
+    assert playbook
+
+    for raw in headers:
+        (frame,) = decode_frames(raw())
+        assert isinstance(frame, hyperframe.frame.HeadersFrame)
+        assert "END_STREAM" not in frame.flags
+
+
+def test_race_group_completions_leave_in_one_send_data(tctx):
+    """Test that a full group's completions are written as a single SendData."""
+    playbook, _ = _race_playbook(tctx, RaceGroupSpec("coupons", 3))
+    released = Placeholder(bytes)
+
+    assert (
+        playbook
+        # The first two completions are withheld; only the deadline is armed.
+        >> RequestEndOfMessage(1)
+        << RequestWakeup(10)
+        >> RequestEndOfMessage(2)
+        >> RequestEndOfMessage(3)
+        << SendData(tctx.server, released)
+    )
+
+    frames = decode_frames(released())
+    assert [f.stream_id for f in frames] == [1, 3, 5]
+    assert all(
+        isinstance(f, hyperframe.frame.DataFrame) and "END_STREAM" in f.flags
+        for f in frames
+    )
+
+
+def test_race_group_times_out_and_releases_un_raced(tctx):
+    """Test that a group missing a member is released normally when the clock runs out."""
+    playbook, _ = _race_playbook(tctx, RaceGroupSpec("coupons", 3))
+    released = Placeholder(bytes)
+
+    assert (
+        playbook
+        >> RequestEndOfMessage(1)
+        << RequestWakeup(10)
+        >> RequestEndOfMessage(2)
+        # The third member never arrives and the deadline fires.
+        >> reply(to=-2)
+        << Log(
+            "Race group 'coupons' timed out after 10s -- the rest either never "
+            "arrived or went to another connection. Releasing 2/3 held members "
+            "un-raced.",
+            WARNING,
+        )
+        << SendData(tctx.server, released)
+    )
+
+    frames = decode_frames(released())
+    assert [f.stream_id for f in frames] == [1, 3]
+    assert all("END_STREAM" in f.flags for f in frames)
+
+
+def test_race_group_fails_when_a_member_is_stuck_behind_flow_control(tctx):
+    """Test that a member whose body is still queued fails the group loudly."""
+    # Its completion would be appended to that queue rather than serialised, so it
+    # would quietly miss the release. The group must refuse instead.
+    playbook, _ = _race_playbook(tctx, RaceGroupSpec("coupons", 3))
+    body = Placeholder(bytes)
+    released = Placeholder(bytes)
+
+    assert (
+        playbook
+        # Overshoot the 65535-byte window so a remainder stays buffered.
+        >> RequestData(1, b"x" * 70000)
+        << SendData(tctx.server, body)
+        >> RequestEndOfMessage(1)
+        << RequestWakeup(10)
+        >> RequestEndOfMessage(2)
+        >> RequestEndOfMessage(3)
+        << Log(
+            "Race group 'coupons' cannot be released in one write. Releasing "
+            "3/3 held members un-raced, 1 still queued behind flow control.",
+            WARNING,
+        )
+        << SendData(tctx.server, released)
+    )
+
+    # The stuck member is not in the write; the other two complete normally.
+    assert [f.stream_id for f in decode_frames(released())] == [3, 5]
+
+
+def test_race_group_fails_when_a_member_is_reset(tctx):
+    """Test that a member lost to a stream reset fails the group rather than hanging."""
+    playbook, _ = _race_playbook(tctx, RaceGroupSpec("coupons", 3))
+    rst = hyperframe.frame.RstStreamFrame(stream_id=1)
+    rst.error_code = 8  # CANCEL
+    survivor = Placeholder(bytes)
+    latecomer = Placeholder(bytes)
+
+    assert (
+        playbook
+        >> RequestEndOfMessage(1)
+        << RequestWakeup(10)
+        >> DataReceived(tctx.server, rst.serialize())
+        << ReceiveHttp(Placeholder(ResponseProtocolError))
+        # The group is now unwinnable, so the next member to arrive gives up at
+        # once rather than holding the survivors until everyone has shown up.
+        >> RequestEndOfMessage(2)
+        << Log(
+            "Race group 'coupons' lost a member. Releasing 1/3 held members "
+            "un-raced, 1 lost to a stream reset.",
+            WARNING,
+        )
+        << SendData(tctx.server, survivor)
+        # With the group retired, the last member is no longer held at all.
+        >> RequestEndOfMessage(3)
+        << SendData(tctx.server, latecomer)
+    )
+
+    assert [f.stream_id for f in decode_frames(survivor())] == [3]
+    assert [f.stream_id for f in decode_frames(latecomer())] == [5]
+
+
+def test_a_reused_group_id_gets_its_own_deadline(tctx):
+    """Test that a second group of the same name is not starved by the first's timer."""
+    # A retired group used to leave its deadline behind, so the next group with
+    # that name armed none of its own and was then killed by the stale one.
+    tctx.options.http2_ping_keepalive = 0
+    tctx.server.alpn = b"h2"
+    playbook = Playbook(Http2Client(tctx), hooks=False)
+    spec = RaceGroupSpec("coupons", 2)
+    req = Request.make("GET", "http://example.com/")
+
+    playbook << SendData(tctx.server, Placeholder(bytes))
+    for i in (1, 2):
+        playbook >> RequestHeaders(i, req, end_stream=True, race_group=spec)
+        playbook << SendData(tctx.server, Placeholder(bytes))
+
+    assert (
+        playbook
+        >> RequestEndOfMessage(1)
+        << RequestWakeup(10)
+        >> RequestEndOfMessage(2)
+        << SendData(tctx.server, Placeholder(bytes))
+    )
+
+    # Second group, same name, on the same connection.
+    for i in (3, 4):
+        playbook >> RequestHeaders(i, req, end_stream=True, race_group=spec)
+        playbook << SendData(tctx.server, Placeholder(bytes))
+
+    second = Placeholder(bytes)
+    assert (
+        playbook
+        >> RequestEndOfMessage(3)
+        << RequestWakeup(10)  # its own deadline, not the first group's leftover
+        >> RequestEndOfMessage(4)
+        << SendData(tctx.server, second)
+    )
+    assert [f.stream_id for f in decode_frames(second())] == [5, 7]
+
+
+def test_register_race_member_counts_only_free_streams(tctx):
+    """Test that a group larger than the remaining capacity is refused."""
+    # Members that fit would otherwise hold the connection at capacity while the
+    # rest sit in stream_queue waiting for a slot only this group can free.
+    tctx.options.http2_ping_keepalive = 0
+    tctx.server.alpn = b"h2"
+    client = Http2Client(tctx)
+    playbook = Playbook(client, hooks=False)
+    req = Request.make("GET", "http://example.com/")
+
+    playbook << SendData(tctx.server, Placeholder(bytes))
+    for i in range(1, 6):  # five ordinary requests, left open
+        playbook >> RequestHeaders(i, req, end_stream=False)
+        playbook << SendData(tctx.server, Placeholder(bytes))
+    assert playbook
+
+    logs = list(client.register_race_member(99, RaceGroupSpec("coupons", 10)))
+    assert len(logs) == 1
+    assert "5 of 10 concurrent streams still free" in logs[0].message
+    assert client.race_groups.group_for(99) is None
+
+
+def test_race_members_ready_rejects_queued_trailers(tctx):
+    """Test that a member with trailers queued is not treated as releasable."""
+    # A guard-rail, not a reachable path: HttpStream refuses a declaration on a
+    # request with trailers, so this state cannot occur today. It is poked into
+    # place directly. If that refusal is ever relaxed, this is the second line of
+    # defence -- so do not read this test as covering the HttpStream check.
+    client = Http2Client(tctx)
+    group = client.race_groups.register(1, "coupons", 1)
+    assert client.race_members_ready(group)
+
+    client.h2_conn.stream_trailers[1] = [(b"x-trailer", b"1")]
+    assert not client.race_members_ready(group)
+
+
+def test_a_request_with_trailers_is_not_raced(tctx):
+    """Test that a declared request with trailers is dropped from its group."""
+    tctx.server.alpn = b"h2"
+    stream = HttpStream(tctx, 1)
+    stream.flow = HTTPFlow(tctx.client, tctx.server)
+    stream.flow.request = Request.make("POST", "http://example.com/", b"body")
+    stream.flow.request.trailers = Headers([(b"x-trailer", b"1")])
+    stream.flow.metadata["race_group"] = {"id": "coupons", "expected": 2}
+
+    commands = list(stream.send_buffered_request())
+
+    warning = commands[0]
+    assert (
+        "a request with trailers cannot have its completion withheld" in warning.message
+    )
+    headers = next(
+        c.event
+        for c in commands
+        if isinstance(c, SendHttp) and isinstance(c.event, RequestHeaders)
+    )
+    assert headers.race_group is None
+
+
+def _declared_stream(tctx, alpn=b"h2", streamed=False):
+    """Build an HttpStream whose flow carries a race group declaration."""
+    tctx.server.alpn = alpn
+    stream = HttpStream(tctx, 1)
+    stream.flow = HTTPFlow(tctx.client, tctx.server)
+    stream.flow.request = Request.make("POST", "http://example.com/", b"body")
+    stream.flow.request.stream = streamed
+    stream.flow.metadata["race_group"] = {"id": "coupons", "expected": 2}
+    return stream
+
+
+def test_a_declaration_over_a_non_h2_upstream_is_refused(tctx):
+    """Test that declaring a race on an HTTP/1 or HTTP/3 upstream says so."""
+    # Only the HTTP/2 client layer can withhold a completion, so anywhere else the
+    # declaration would otherwise be ignored without a word.
+    stream = _declared_stream(tctx, alpn=b"http/1.1")
+
+    (log,) = list(stream.race_group_for_request())
+
+    assert "needs an HTTP/2 upstream connection" in log.message
+
+
+def test_a_streamed_request_is_not_raced(tctx):
+    """Test that a streamed request explains why it cannot take part."""
+    stream = _declared_stream(tctx, streamed=True)
+
+    (log,) = list(stream.race_group_for_request())
+
+    assert "streamed request cannot have its completion withheld" in log.message
+
+
+def test_an_undeclared_request_is_silent(tctx):
+    """Test that a request with no declaration produces no chatter."""
+    tctx.server.alpn = b"h2"
+    stream = HttpStream(tctx, 1)
+    stream.flow = HTTPFlow(tctx.client, tctx.server)
+    stream.flow.request = Request.make("GET", "http://example.com/")
+
+    assert list(stream.race_group_for_request()) == []
+
+
+def test_stage_degrades_instead_of_tearing_down_the_connection(tctx):
+    """Test that an illegal state transition sends the request rather than raising."""
+    client = Http2Client(tctx)
+    client.race_groups.register(1, "coupons", 2)
+    list(client.stage_race_member(1))  # legitimate first staging
+
+    logs = list(client.stage_race_member(1))  # cannot stage twice
+
+    assert any("sending this request un-raced" in log.message for log in logs)
+
+
+def test_a_retired_groups_deadline_fires_harmlessly(tctx):
+    """Test that the wakeup left over from a released group does nothing at all."""
+    # The wakeup is already scheduled when the first member is held and cannot be
+    # unscheduled, so its entry has to stay recognisable. Forgetting it instead
+    # would send it to the ping keepalive branch, which reschedules itself -- one
+    # permanent extra PING timer per race, and with http2_ping_keepalive=0 a tight
+    # loop, because that branch then yields a negative delay.
+    playbook, _ = _race_playbook(tctx, RaceGroupSpec("coupons", 3))
+
+    assert (
+        playbook
+        >> RequestEndOfMessage(1)
+        << RequestWakeup(10)
+        >> RequestEndOfMessage(2)
+        >> RequestEndOfMessage(3)
+        << SendData(tctx.server, Placeholder(bytes))
+        # The deadline now fires against a group that has already gone.
+        >> reply(to=-5)
+    )
+
+    assert playbook.layer._race_deadlines == {}
+
+
+def test_register_race_member_reports_a_contradictory_declaration(tctx):
+    """Test that two different sizes for one group id are refused with the reason."""
+    client = Http2Client(tctx)
+    list(client.register_race_member(1, RaceGroupSpec("coupons", 2)))
+
+    logs = list(client.register_race_member(3, RaceGroupSpec("coupons", 3)))
+
+    assert len(logs) == 1
+    assert "expects 2 members, not 3" in logs[0].message
+
+
+def test_a_repeated_completion_is_sent_un_raced(tctx):
+    """Test that a second completion for a staged member is sent rather than raised."""
+    playbook, _ = _race_playbook(tctx, RaceGroupSpec("coupons", 2), members=2)
+    sent = Placeholder(bytes)
+
+    assert (
+        playbook
+        >> RequestEndOfMessage(1)
+        << RequestWakeup(10)
+        # The same member completes again: bookkeeping refuses, but the request
+        # must still go out rather than taking the connection down.
+        >> RequestEndOfMessage(1)
+        << Log(
+            "Race group: cannot stage stream 1 from staged; sending this request "
+            "un-raced.",
+            WARNING,
+        )
+        << SendData(tctx.server, sent)
+    )
+    assert [f.stream_id for f in decode_frames(sent())] == [1]
+
+
+def test_a_malformed_declaration_is_reported_at_the_stream(tctx):
+    """Test that a broken declaration is logged where the flow is read."""
+    tctx.server.alpn = b"h2"
+    stream = HttpStream(tctx, 1)
+    stream.flow = HTTPFlow(tctx.client, tctx.server)
+    stream.flow.request = Request.make("GET", "http://example.com/")
+    stream.flow.metadata["race_group"] = {"id": "coupons", "expected": "3"}
+
+    (log,) = list(stream.race_group_for_request())
+
+    assert "must be a positive int" in log.message

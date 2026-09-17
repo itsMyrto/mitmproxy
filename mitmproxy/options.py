@@ -145,6 +145,18 @@ class Options(optmanager.OptManager):
             """,
         )
         self.add_option(
+            "race_group_timeout",
+            int,
+            10,
+            """
+            How many seconds to hold the members of an HTTP/2 race group while
+            waiting for the rest of the group to be ready. On expiry the members
+            held so far are sent normally, without being raced.
+            Set to 0 to disable this feature, which leaves an incomplete group
+            held until its connection closes.
+            """,
+        )
+        self.add_option(
             "http3",
             bool,
             True,

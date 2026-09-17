@@ -3,6 +3,7 @@ import typing
 from dataclasses import dataclass
 
 from ._base import HttpEvent
+from ._race import RaceGroupSpec
 from mitmproxy import http
 from mitmproxy.http import HTTPFlow
 from mitmproxy.net.http import status_codes
@@ -19,6 +20,8 @@ class RequestHeaders(HttpEvent):
     """
     replay_flow: HTTPFlow | None = None
     """If set, the current request headers belong to a replayed flow, which should be reused."""
+    race_group: RaceGroupSpec | None = None
+    """If set, an addon declared this request a member of a race group."""
 
 
 @dataclass
