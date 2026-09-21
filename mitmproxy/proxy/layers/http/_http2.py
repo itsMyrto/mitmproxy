@@ -641,9 +641,13 @@ class Http2Client(Http2Connection):
             if self.is_open_for_us(stream_id):
                 self._end_race_member(stream_id)
         for stream_id in group.members:
-            # Members left out above -- lost to a stream reset, say -- would
-            # otherwise leave their withheld byte behind.
-            self._race_tails.pop(stream_id, None)
+            # A member not ended above stops racing but keeps going, so hand back
+            # the byte withheld from its body. Dropping it here would truncate the
+            # request: its own completion ends the stream in the ordinary way, and
+            # that completion carries no body.
+            if tail := self._race_tails.pop(stream_id, b""):
+                if self.is_open_for_us(stream_id):
+                    self.h2_conn.send_data(stream_id, tail)
         group.released = True
         self.race_groups.finish(group.id)
         # The deadline entry is deliberately left in place: its wakeup is already

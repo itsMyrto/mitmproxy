@@ -377,6 +377,44 @@ def test_withheld_bytes_share_one_connection_window(tctx):
     assert [f.stream_id for f in decode_frames(released())] == [1, 3]
 
 
+def test_a_member_that_stops_racing_gets_its_withheld_byte_back(tctx):
+    """Test that giving up on a group does not truncate a member still in flight."""
+    # A member whose body is still arriving when the group is retired goes on as
+    # an ordinary request. Its own completion ends the stream and carries no body,
+    # so the byte held back from it has to be handed over first.
+    playbook, _ = _race_playbook(tctx, RaceGroupSpec("coupons", 2), members=2)
+    released = Placeholder(bytes)
+    completion = Placeholder(bytes)
+
+    assert (
+        playbook
+        >> RequestData(1, b"hello")
+        << SendData(tctx.server, Placeholder(bytes))
+        >> RequestData(2, b"world")
+        << SendData(tctx.server, Placeholder(bytes))
+        # Only the first member completes, so the deadline gives up on the group
+        # while the second is still mid-body.
+        >> RequestEndOfMessage(1)
+        << RequestWakeup(10)
+        >> reply(to=-1)
+        << Log(Placeholder(str), WARNING)
+        << SendData(tctx.server, released)
+        >> RequestEndOfMessage(2)
+        << SendData(tctx.server, completion)
+    )
+
+    # The first member is completed by its held byte, the second is handed its
+    # own back without being completed.
+    assert [(f.stream_id, f.data) for f in decode_frames(released())] == [
+        (1, b"o"),
+        (3, b"d"),
+    ]
+    assert "END_STREAM" not in decode_frames(released())[1].flags
+    (end,) = decode_frames(completion())
+    assert (end.stream_id, end.data) == (3, b"")
+    assert "END_STREAM" in end.flags
+
+
 def test_a_lost_members_withheld_byte_is_dropped(tctx):
     """Test that a member that never completes leaves no held byte behind."""
     playbook, _ = _race_playbook(tctx, RaceGroupSpec("coupons", 2), members=2)
