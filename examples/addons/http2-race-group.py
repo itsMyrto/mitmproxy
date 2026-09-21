@@ -1,5 +1,5 @@
 """
-Complete a group of HTTP/2 requests in a single packet.
+Complete a group of HTTP/2 requests in a single write.
 
 A race condition in a server is easiest to reach when several requests become
 processable at the very same moment. Sending them one after another leaves
