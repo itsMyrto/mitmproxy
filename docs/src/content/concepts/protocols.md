@@ -59,7 +59,9 @@ cannot be honoured is logged and the request is sent normally, so a declaration 
 changes whether a request is delivered -- only when it completes.
 
 If a group is still incomplete after `http2_race_group_timeout` seconds (10 by default), the
-members held so far are sent without being raced.
+members held so far are sent without being raced. A group is also given up on the moment
+one of its members is turned away -- because the connection has no stream free for it, say
+-- so the rest are released there and then rather than waiting out the clock.
 
 ##### Known Limitations
 

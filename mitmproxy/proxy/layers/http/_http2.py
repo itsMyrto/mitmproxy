@@ -536,6 +536,22 @@ class Http2Client(Http2Connection):
                     or self.h2_conn.remote_settings.max_concurrent_streams
                 )
                 if no_free_streams:
+                    if (
+                        isinstance(event, RequestHeaders)
+                        and event.race_group is not None
+                        and self.race_groups.group(event.race_group.id) is not None
+                    ):
+                        # Part of this group is registered already and holding
+                        # streams open. Parking this member undecided would leave
+                        # them held until the deadline, waiting for one that
+                        # cannot get a stream. A group with nothing registered
+                        # yet holds nothing, so it can wait for the queue.
+                        yield from self.refuse_race_member(
+                            event.race_group,
+                            "the connection has no free stream for the rest of "
+                            "the group",
+                        )
+                        event.race_group = None
                     self.stream_queue[event.stream_id].append(event)
                     return
                 ours = self.h2_conn.get_next_available_stream_id()
@@ -562,16 +578,22 @@ class Http2Client(Http2Connection):
             for event in events:
                 yield from self._handle_event(event)
 
+    def refuse_race_member(
+        self, spec: RaceGroupSpec, reason: str
+    ) -> CommandGenerator[None]:
+        """Turn a member away, and give up on the group that was counting on it."""
+        yield Log(f"Ignoring race group {spec.id!r}: {reason}.", WARNING)
+        group = self.race_groups.group(spec.id)
+        if group is not None:
+            # Short one member for good, the group can never reach its size, so
+            # whatever is held for it would only sit there until the deadline.
+            yield from self.fail_race_group(group, "cannot take every member")
+            yield from self._flush()
+
     def register_race_member(
         self, stream_id: int, spec: RaceGroupSpec
     ) -> CommandGenerator[None]:
         """Add a stream to its declared race group, or log why it cannot take part."""
-        # This guard covers a group declared while the connection has room. A group
-        # that straddles saturation escapes it: once the connection is full,
-        # _handle_event parks the event in stream_queue and returns before reaching
-        # here, so those members are neither checked nor registered. Such a group
-        # simply never arms and is released by its timeout, which then frees the
-        # slots. Bounding that properly means checking above the queueing branch.
         limit = (
             self.provisional_max_concurrency
             or self.h2_conn.remote_settings.max_concurrent_streams
@@ -585,15 +607,17 @@ class Http2Client(Http2Connection):
             # Otherwise the members that do fit hold the connection at capacity
             # while the rest sit in stream_queue waiting for a slot that only the
             # group's own release can free.
-            yield Log(
-                f"Ignoring race group {spec.id!r}: {spec.expected} members exceed "
-                f"the {available} of {limit} concurrent streams still free.",
-                WARNING,
+            yield from self.refuse_race_member(
+                spec,
+                f"{spec.expected} members exceed the {available} of {limit} "
+                f"concurrent streams still free",
             )
             return
         try:
             self.race_groups.register(stream_id, spec.id, spec.expected)
         except RaceGroupError as e:
+            # A bookkeeping mistake belongs to this member alone: the group it
+            # named may still be perfectly able to complete without it.
             yield Log(f"Ignoring race group {spec.id!r}: {e}", WARNING)
 
     def _blocked_members(self, stream_ids: Iterable[int]) -> list[int]:

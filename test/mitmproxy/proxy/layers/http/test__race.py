@@ -588,6 +588,72 @@ def test_register_race_member_counts_only_free_streams(tctx):
     assert client.race_groups.group_for(99) is None
 
 
+def _saturating_playbook(tctx, spec, ordinary):
+    """Hold one member, then fill the connection with `ordinary` other requests."""
+    tctx.options.http2_ping_keepalive = 0
+    tctx.server.alpn = b"h2"
+    client = Http2Client(tctx)
+    playbook = Playbook(client, hooks=False)
+    req = Request.make("GET", "http://example.com/")
+
+    playbook << SendData(tctx.server, Placeholder(bytes))  # preamble + settings
+    if spec is not None:
+        playbook >> RequestHeaders(1, req, end_stream=True, race_group=spec)
+        playbook << SendData(tctx.server, Placeholder(bytes))
+        playbook >> RequestEndOfMessage(1)
+        playbook << RequestWakeup(10)
+    for i in range(2, 2 + ordinary):
+        playbook >> RequestHeaders(i, req, end_stream=False)
+        playbook << SendData(tctx.server, Placeholder(bytes))
+    assert playbook
+    return client, playbook, req
+
+
+def test_a_refused_member_releases_the_group_at_once(tctx):
+    """Test that a group short one member gives up rather than waiting out the clock."""
+    # The member that cannot get a stream is never coming, so holding the rest
+    # until the deadline is a stall with a known outcome.
+    spec = RaceGroupSpec("coupons", 3)
+    client, playbook, req = _saturating_playbook(tctx, spec, ordinary=9)
+    released = Placeholder(bytes)
+
+    assert (
+        playbook
+        >> RequestHeaders(99, req, end_stream=True, race_group=spec)
+        << Log(
+            "Ignoring race group 'coupons': the connection has no free stream "
+            "for the rest of the group.",
+            WARNING,
+        )
+        << Log(
+            "Race group 'coupons' cannot take every member. Releasing 1/3 held "
+            "members un-raced.",
+            WARNING,
+        )
+        << SendData(tctx.server, released)
+    )
+
+    assert [f.stream_id for f in decode_frames(released())] == [1]
+    # The refused member waits for a stream as an ordinary request: keeping its
+    # declaration would start a second group that would be held all over again.
+    (queued,) = client.stream_queue[99]
+    assert queued.race_group is None
+
+
+def test_a_member_is_queued_while_its_group_holds_nothing(tctx):
+    """Test that a group with nothing registered yet waits for a free stream."""
+    # Nothing is held, so there is nothing to strand. The member can sit in the
+    # queue and be judged against the capacity there is once it gets a stream.
+    spec = RaceGroupSpec("coupons", 3)
+    client, playbook, req = _saturating_playbook(tctx, None, ordinary=10)
+
+    assert playbook >> RequestHeaders(99, req, end_stream=True, race_group=spec)
+
+    assert client.race_groups.group("coupons") is None
+    (queued,) = client.stream_queue[99]
+    assert queued.race_group == spec
+
+
 def test_race_members_ready_rejects_queued_trailers(tctx):
     """Test that a member with trailers queued is not treated as releasable."""
     # A guard-rail, not a reachable path: HttpStream refuses a declaration on a
