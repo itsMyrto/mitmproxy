@@ -130,6 +130,10 @@ class Http2Connection(HttpConnection):
         else:
             return False
 
+    def clear_race_state(self) -> None:
+        """Drop what this connection is holding on behalf of race groups."""
+        self.race_groups.clear()
+
     def _flush(self) -> CommandGenerator[None]:
         """Send any pending hyper-h2 output to the transport."""
         if data := self.h2_conn.data_to_send():
@@ -291,7 +295,7 @@ class Http2Connection(HttpConnection):
             yield from self.protocol_error(f"HTTP/2 protocol error: {event}")
             return True
         elif isinstance(event, h2.events.ConnectionTerminated):
-            self.race_groups.clear()
+            self.clear_race_state()
             yield from self.close_connection(f"HTTP/2 connection closed: {event!r}")
             return True
             # The implementation above isn't really ideal, we should probably only terminate streams > last_stream_id?
@@ -523,6 +527,17 @@ class Http2Client(Http2Connection):
         self.stream_queue = collections.defaultdict(list)
         self._race_deadlines = {}
         self._race_tails = {}
+
+    def clear_race_state(self) -> None:
+        super().clear_race_state()
+        self._race_tails.clear()
+        # The deadline entries deliberately stay. Their wakeups are already
+        # scheduled and cannot be unscheduled, and one we no longer recognise
+        # falls through to the ping keepalive branch, which would reschedule it
+        # forever. Retiring the groups instead leaves each wakeup a no-op that
+        # pops itself.
+        for group in self._race_deadlines.values():
+            group.released = True
 
     def _handle_event(self, event: Event) -> CommandGenerator[None]:
         # We can't reuse stream ids from the client because they may arrived reordered here

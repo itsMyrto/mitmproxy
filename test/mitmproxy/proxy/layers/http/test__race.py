@@ -7,6 +7,7 @@ from mitmproxy.http import Headers
 from mitmproxy.http import HTTPFlow
 from mitmproxy.http import RaceGroupSpec
 from mitmproxy.http import Request
+from mitmproxy.proxy.commands import CloseConnection
 from mitmproxy.proxy.commands import Log
 from mitmproxy.proxy.commands import RequestWakeup
 from mitmproxy.proxy.commands import SendData
@@ -525,6 +526,35 @@ def test_race_group_fails_when_a_member_is_reset(tctx):
 
     assert [f.stream_id for f in decode_frames(survivor())] == [3]
     assert [f.stream_id for f in decode_frames(latecomer())] == [5]
+
+
+def test_a_terminated_connection_drops_its_race_state(tctx):
+    """Test that a dead connection stops holding anything on a group's behalf."""
+    # The layer goes inert the moment it closes, so none of this is acted on
+    # again; it is the held state itself that should not outlive the connection.
+    playbook, _ = _race_playbook(tctx, RaceGroupSpec("coupons", 2), members=2)
+    goaway = hyperframe.frame.GoAwayFrame(stream_id=0)
+    goaway.last_stream_id = 0
+    goaway.error_code = 0
+
+    assert (
+        playbook
+        >> RequestData(1, b"hello")
+        << SendData(tctx.server, Placeholder(bytes))
+        >> RequestEndOfMessage(1)
+        << RequestWakeup(10)
+        >> DataReceived(tctx.server, goaway.serialize())
+        << CloseConnection(tctx.server)
+        << ReceiveHttp(Placeholder(ResponseProtocolError))
+        << ReceiveHttp(Placeholder(ResponseProtocolError))
+    )
+
+    client = playbook.layer
+    assert client.race_groups.group("coupons") is None
+    assert client._race_tails == {}
+    # Retired rather than forgotten: an unrecognised wakeup would fall through to
+    # the ping keepalive branch and reschedule itself forever.
+    assert all(group.released for group in client._race_deadlines.values())
 
 
 def test_a_reused_group_id_gets_its_own_deadline(tctx):
