@@ -33,7 +33,7 @@ class RaceGroup:
         if self.members >= GROUP_SIZE:
             return  # the group is full; let the rest through normally
         self.members += 1
-        flow.metadata["race_group"] = {"id": "redeem", "expected": GROUP_SIZE}
+        flow.request.race_group = http.RaceGroupSpec("redeem", GROUP_SIZE)
         logging.info(f"race group 'redeem': member {self.members}/{GROUP_SIZE}")
 
 

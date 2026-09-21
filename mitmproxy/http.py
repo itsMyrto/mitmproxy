@@ -513,12 +513,41 @@ class Message(serializable.Serializable):
             return json.loads(content, **kwargs)
 
 
+@dataclass(frozen=True)
+class RaceGroupSpec:
+    """An addon's declaration that one request takes part in a race group."""
+
+    id: str
+    """The name shared by every member of the group."""
+    expected: int
+    """How many members the group is complete at."""
+
+    def __post_init__(self) -> None:
+        if not self.id:
+            raise ValueError("a race group needs a non-empty id")
+        if self.expected < 1:
+            raise ValueError(f"a race group cannot expect {self.expected} members")
+
+
 class Request(Message):
     """
     An HTTP request.
     """
 
     data: RequestData
+    race_group: RaceGroupSpec | None = None
+    """
+    This attribute declares the request a member of a race group: a set of requests
+    whose completions mitmproxy withholds until every member is ready, so that the
+    server sees them all become processable at the same moment.
+
+    Every member must share one upstream HTTP/2 connection, so they need the same
+    destination. Anything that cannot be honoured is logged and the request is sent
+    normally, so a declaration never changes whether a request is delivered -- only
+    when it completes.
+
+    This attribute must be set no later than the `request` hook.
+    """
 
     def __init__(
         self,

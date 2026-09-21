@@ -32,10 +32,12 @@ Addons can have a group of requests completed at the same moment, so that the se
 them all become processable together rather than milliseconds apart. This is useful for
 testing how a server handles genuinely concurrent requests.
 
-An addon marks each participating flow:
+An addon marks each participating request, no later than the `request` hook:
 
 ```python
-flow.metadata["race_group"] = {"id": "checkout", "expected": 3}
+from mitmproxy.http import RaceGroupSpec
+
+flow.request.race_group = RaceGroupSpec("checkout", 3)
 ```
 
 mitmproxy then sends each member's headers and body as usual, except for the final byte of

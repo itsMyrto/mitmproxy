@@ -7,37 +7,6 @@ class RaceGroupError(Exception):
     """An illegal race group registration or state transition."""
 
 
-METADATA_KEY = "race_group"
-"""The flow metadata key an addon sets to declare a race group membership."""
-
-
-@dataclass(frozen=True)
-class RaceGroupSpec:
-    """An addon's declaration that one request takes part in a race group."""
-
-    id: str
-    expected: int
-
-
-def spec_from_metadata(metadata: dict) -> RaceGroupSpec | None:
-    """Read a race group declaration off a flow's metadata, if it carries one."""
-    raw = metadata.get(METADATA_KEY)
-    if raw is None:
-        return None
-    if not isinstance(raw, dict):
-        # Must stay a plain dict: flow metadata is tnetstring-serialised when
-        # flows are saved, and anything else fails to serialise.
-        raise RaceGroupError(f"{METADATA_KEY} must be a dict, not {type(raw).__name__}")
-
-    group_id = raw.get("id")
-    expected = raw.get("expected")
-    if not isinstance(group_id, str) or not group_id:
-        raise RaceGroupError(f"{METADATA_KEY}['id'] must be a non-empty string")
-    if not isinstance(expected, int) or isinstance(expected, bool) or expected < 1:
-        raise RaceGroupError(f"{METADATA_KEY}['expected'] must be a positive int")
-    return RaceGroupSpec(group_id, expected)
-
-
 class MemberState(enum.Enum):
     """Lifecycle of a single stream within a race group."""
 

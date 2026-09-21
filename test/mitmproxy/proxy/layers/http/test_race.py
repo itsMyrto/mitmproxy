@@ -5,8 +5,8 @@ import pytest
 
 from mitmproxy.http import Headers
 from mitmproxy.http import HTTPFlow
+from mitmproxy.http import RaceGroupSpec
 from mitmproxy.http import Request
-from mitmproxy.io import tnetstring
 from mitmproxy.proxy.commands import Log
 from mitmproxy.proxy.commands import RequestWakeup
 from mitmproxy.proxy.commands import SendData
@@ -21,9 +21,7 @@ from mitmproxy.proxy.layers.http._base import ReceiveHttp
 from mitmproxy.proxy.layers.http._http2 import Http2Client
 from mitmproxy.proxy.layers.http._race import MemberState
 from mitmproxy.proxy.layers.http._race import RaceGroupError
-from mitmproxy.proxy.layers.http._race import RaceGroupSpec
 from mitmproxy.proxy.layers.http._race import RaceRegistry
-from mitmproxy.proxy.layers.http._race import spec_from_metadata
 from test.mitmproxy.proxy.layers.http.test_http2 import decode_frames
 from test.mitmproxy.proxy.tutils import Placeholder
 from test.mitmproxy.proxy.tutils import Playbook
@@ -196,56 +194,6 @@ def test_clear_drops_every_group():
 
     assert reg.group_for(1) is None
     assert reg.group_for(3) is None
-
-
-def test_spec_from_metadata_without_a_declaration():
-    """Test that a flow carrying no declaration produces no spec."""
-    assert spec_from_metadata({}) is None
-
-
-def test_spec_from_metadata_reads_a_declaration():
-    """Test that a well-formed declaration is read off the metadata."""
-    spec = spec_from_metadata({"race_group": {"id": "coupons", "expected": 3}})
-    assert spec == RaceGroupSpec("coupons", 3)
-
-
-def test_spec_from_metadata_rejects_a_spec_object():
-    """Test that the declaration must stay a plain dict."""
-    # flow.metadata is tnetstring-serialised when flows are saved, and anything
-    # that is not a plain type makes saving fail.
-    with pytest.raises(RaceGroupError, match="must be a dict"):
-        spec_from_metadata({"race_group": RaceGroupSpec("coupons", 3)})
-
-
-def test_a_declaration_survives_flow_serialisation():
-    """Test that the declared dict can be written out with the flow."""
-    declaration = {"id": "coupons", "expected": 3}
-    assert spec_from_metadata({"race_group": declaration}) == RaceGroupSpec(
-        "coupons", 3
-    )
-    assert tnetstring.loads(tnetstring.dumps({"race_group": declaration})) == {
-        "race_group": declaration
-    }
-
-
-@pytest.mark.parametrize(
-    "declaration",
-    [
-        "coupons",
-        {"id": "", "expected": 3},
-        {"id": 7, "expected": 3},
-        {"expected": 3},
-        {"id": "coupons", "expected": 0},
-        {"id": "coupons", "expected": -1},
-        {"id": "coupons", "expected": "3"},
-        {"id": "coupons", "expected": True},
-        {"id": "coupons"},
-    ],
-)
-def test_spec_from_metadata_rejects_a_malformed_declaration(declaration):
-    """Test that a malformed declaration is reported rather than half-read."""
-    with pytest.raises(RaceGroupError):
-        spec_from_metadata({"race_group": declaration})
 
 
 def test_register_race_member_registers_the_upstream_stream_id(tctx):
@@ -623,7 +571,7 @@ def test_a_request_with_trailers_is_not_raced(tctx):
     stream.flow = HTTPFlow(tctx.client, tctx.server)
     stream.flow.request = Request.make("POST", "http://example.com/", b"body")
     stream.flow.request.trailers = Headers([(b"x-trailer", b"1")])
-    stream.flow.metadata["race_group"] = {"id": "coupons", "expected": 2}
+    stream.flow.request.race_group = RaceGroupSpec("coupons", 2)
 
     commands = list(stream.send_buffered_request())
 
@@ -646,7 +594,7 @@ def _declared_stream(tctx, alpn=b"h2", streamed=False):
     stream.flow = HTTPFlow(tctx.client, tctx.server)
     stream.flow.request = Request.make("POST", "http://example.com/", b"body")
     stream.flow.request.stream = streamed
-    stream.flow.metadata["race_group"] = {"id": "coupons", "expected": 2}
+    stream.flow.request.race_group = RaceGroupSpec("coupons", 2)
     return stream
 
 
@@ -773,16 +721,3 @@ def test_an_un_raced_completion_still_carries_the_withheld_byte(tctx):
     (frame,) = decode_frames(sent())
     assert frame.data == b"o"
     assert "END_STREAM" in frame.flags
-
-
-def test_a_malformed_declaration_is_reported_at_the_stream(tctx):
-    """Test that a broken declaration is logged where the flow is read."""
-    tctx.server.alpn = b"h2"
-    stream = HttpStream(tctx, 1)
-    stream.flow = HTTPFlow(tctx.client, tctx.server)
-    stream.flow.request = Request.make("GET", "http://example.com/")
-    stream.flow.metadata["race_group"] = {"id": "coupons", "expected": "3"}
-
-    (log,) = list(stream.race_group_for_request())
-
-    assert "must be a positive int" in log.message

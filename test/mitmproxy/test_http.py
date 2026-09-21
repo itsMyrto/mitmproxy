@@ -12,6 +12,7 @@ from mitmproxy import flowfilter
 from mitmproxy.http import Headers
 from mitmproxy.http import HTTPFlow
 from mitmproxy.http import Message
+from mitmproxy.http import RaceGroupSpec
 from mitmproxy.http import Request
 from mitmproxy.http import Response
 from mitmproxy.net.http.cookies import CookieAttrs
@@ -248,6 +249,25 @@ class TestRequestCore:
         h2.host_header = None
         assert "host" not in h2.headers
         assert not h2.authority
+
+
+class TestRaceGroupSpec:
+    def test_declares_a_group(self):
+        spec = RaceGroupSpec("checkout", 3)
+        assert spec.id == "checkout"
+        assert spec.expected == 3
+        assert treq().race_group is None
+
+    def test_rejects_an_unnamed_group(self):
+        with pytest.raises(ValueError, match="non-empty id"):
+            RaceGroupSpec("", 3)
+
+    @pytest.mark.parametrize("expected", [0, -1])
+    def test_rejects_a_meaningless_size(self, expected):
+        # Caught here rather than deep in the proxy layer, so the traceback lands
+        # in the addon that got it wrong.
+        with pytest.raises(ValueError, match="cannot expect"):
+            RaceGroupSpec("checkout", expected)
 
 
 class TestRequestUtils:

@@ -3,9 +3,9 @@ import typing
 from dataclasses import dataclass
 
 from ._base import HttpEvent
-from ._race import RaceGroupSpec
 from mitmproxy import http
 from mitmproxy.http import HTTPFlow
+from mitmproxy.http import RaceGroupSpec
 from mitmproxy.net.http import status_codes
 
 

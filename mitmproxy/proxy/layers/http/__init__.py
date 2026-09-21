@@ -43,14 +43,12 @@ from ._http2 import Http2Client
 from ._http2 import Http2Server
 from ._http3 import Http3Client
 from ._http3 import Http3Server
-from ._race import RaceGroupError
-from ._race import RaceGroupSpec
-from ._race import spec_from_metadata
 from mitmproxy import flow
 from mitmproxy import http
 from mitmproxy.connection import Connection
 from mitmproxy.connection import Server
 from mitmproxy.connection import TransportProtocol
+from mitmproxy.http import RaceGroupSpec
 from mitmproxy.net import server_spec
 from mitmproxy.net.http import url
 from mitmproxy.net.http.http1 import expected_http_body_size
@@ -400,12 +398,7 @@ class HttpStream(layer.Layer):
 
     def race_group_for_request(self) -> layer.CommandGenerator[RaceGroupSpec | None]:
         """Read an addon's race group declaration, explaining any reason it cannot hold."""
-        try:
-            spec = spec_from_metadata(self.flow.metadata)
-        except RaceGroupError as e:
-            # A malformed declaration must never break the request it rides on.
-            yield commands.Log(f"Ignoring race group declaration: {e}", WARNING)
-            return None
+        spec = self.flow.request.race_group
         if spec is None:
             return None
 

@@ -8,7 +8,7 @@
 ## Unreleased: mitmproxy next
 
 - Addons can now have a group of HTTP/2 requests completed together in a single packet
-  by setting `flow.metadata["race_group"]`, which is useful for testing how a server
+  by setting `flow.request.race_group`, which is useful for testing how a server
   handles genuinely concurrent requests. See `examples/addons/http2-race-group.py`.
 - Add `launch_edge()` to the Browser addon, so `browser.start edge` can
   launch an isolated, proxy-configured instance of Microsoft Edge, matching

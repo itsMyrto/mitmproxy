@@ -51,11 +51,11 @@ from ._http_h2 import H2ConnectionLogger
 from ._race import MemberState
 from ._race import RaceGroup
 from ._race import RaceGroupError
-from ._race import RaceGroupSpec
 from ._race import RaceRegistry
 from mitmproxy import http
 from mitmproxy import version
 from mitmproxy.connection import Connection
+from mitmproxy.http import RaceGroupSpec
 from mitmproxy.net.http import status_codes
 from mitmproxy.net.http import url
 from mitmproxy.utils import human
