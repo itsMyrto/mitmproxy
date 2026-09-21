@@ -38,9 +38,17 @@ An addon marks each participating flow:
 flow.metadata["race_group"] = {"id": "checkout", "expected": 3}
 ```
 
-mitmproxy then sends each member's headers and body as usual, but withholds the frame that
-ends the stream. Once every member of the group is ready, all of their completions are
-written at once. A worked example is in `examples/addons/http2-race-group.py`.
+mitmproxy then sends each member's headers and body as usual, except for the final byte of
+the body, which it holds back along with the frame that ends the stream. Once every member
+of the group is ready, all of those held-back frames are written at once. Withholding the
+last byte rather than only the empty end-of-stream frame matters: a server that decides a
+message is complete from its `content-length` starts work as soon as the body lands, which
+is the very thing the group is trying to synchronise. A worked example is in
+`examples/addons/http2-race-group.py`.
+
+The release is a single write to the socket. mitmproxy does not warm the connection up
+beforehand or otherwise coerce the network stack, so whether that write lands in a single
+packet is up to the operating system.
 
 Every member must share one upstream HTTP/2 connection, so they must have the same
 destination, and a group may not be larger than that connection's concurrent stream limit.

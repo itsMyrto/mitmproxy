@@ -29,6 +29,9 @@ from test.mitmproxy.proxy.tutils import Placeholder
 from test.mitmproxy.proxy.tutils import Playbook
 from test.mitmproxy.proxy.tutils import reply
 
+_WINDOW = 65535
+"""The flow control window a connection and each of its streams start with."""
+
 
 def test_register_creates_group_with_pending_member():
     """Test that the first registration creates the group and its member is pending."""
@@ -319,6 +322,138 @@ def test_race_group_completions_leave_in_one_send_data(tctx):
     )
 
 
+def test_a_members_final_body_byte_is_withheld(tctx):
+    """Test that a member's body goes out one byte short, and that byte completes it."""
+    # Sending the whole body and withholding only the empty END_STREAM frame is
+    # not enough: a server that completes a message from content-length rather
+    # than from END_STREAM would start work as soon as the body landed.
+    playbook, _ = _race_playbook(tctx, RaceGroupSpec("coupons", 3))
+    body = Placeholder(bytes)
+    released = Placeholder(bytes)
+
+    assert (
+        playbook
+        >> RequestData(1, b"hello")
+        << SendData(tctx.server, body)
+        >> RequestEndOfMessage(1)
+        << RequestWakeup(10)
+        >> RequestEndOfMessage(2)
+        >> RequestEndOfMessage(3)
+        << SendData(tctx.server, released)
+    )
+
+    (sent,) = decode_frames(body())
+    assert sent.data == b"hell"
+    assert "END_STREAM" not in sent.flags
+
+    frames = decode_frames(released())
+    assert [(f.stream_id, f.data) for f in frames] == [(1, b"o"), (3, b""), (5, b"")]
+    assert all("END_STREAM" in f.flags for f in frames)
+
+
+def test_only_the_last_byte_of_a_chunked_body_is_withheld(tctx):
+    """Test that a later body chunk frees the byte an earlier one held back."""
+    playbook, _ = _race_playbook(tctx, RaceGroupSpec("coupons", 1), members=1)
+    sent = Placeholder(bytes)
+    released = Placeholder(bytes)
+
+    assert (
+        playbook
+        # Nothing to send yet: this single byte might still be the body's last.
+        >> RequestData(1, b"a")
+        >> RequestData(1, b"bc")
+        << SendData(tctx.server, sent)
+        >> RequestEndOfMessage(1)
+        << RequestWakeup(10)
+        << SendData(tctx.server, released)
+    )
+
+    assert decode_frames(sent())[0].data == b"ab"
+    assert decode_frames(released())[0].data == b"c"
+
+
+def test_a_withheld_byte_with_no_window_left_fails_the_group(tctx):
+    """Test that a member whose held byte cannot leave fails the group loudly."""
+    # The body drains the flow control window exactly, so nothing is buffered,
+    # but the held byte still has no room -- unlike the empty END_STREAM frame it
+    # replaces, which flow control never applied to.
+    playbook, _ = _race_playbook(tctx, RaceGroupSpec("coupons", 3))
+    released = Placeholder(bytes)
+
+    assert (
+        playbook
+        >> RequestData(1, b"x" * (_WINDOW + 1))
+        << SendData(tctx.server, Placeholder(bytes))
+        >> RequestEndOfMessage(1)
+        << RequestWakeup(10)
+        >> RequestEndOfMessage(2)
+        >> RequestEndOfMessage(3)
+        << Log(
+            "Race group 'coupons' cannot be released in one write. Releasing "
+            "3/3 held members un-raced, 1 still blocked by flow control.",
+            WARNING,
+        )
+        << SendData(tctx.server, released)
+    )
+
+    assert [f.stream_id for f in decode_frames(released())] == [3, 5]
+
+
+def test_withheld_bytes_share_one_connection_window(tctx):
+    """Test that held bytes are checked against the window they all draw on."""
+    # Each member's byte fits its own stream window, but the three of them do not
+    # fit the two bytes of connection window left between them.
+    playbook, _ = _race_playbook(tctx, RaceGroupSpec("coupons", 3))
+    released = Placeholder(bytes)
+
+    assert (
+        playbook
+        >> RequestData(1, b"a" * (_WINDOW - 3))  # leaves 4 bytes, holds 1 back
+        << SendData(tctx.server, Placeholder(bytes))
+        >> RequestData(2, b"bb")
+        << SendData(tctx.server, Placeholder(bytes))
+        >> RequestData(3, b"cc")
+        << SendData(tctx.server, Placeholder(bytes))
+        >> RequestEndOfMessage(1)
+        << RequestWakeup(10)
+        >> RequestEndOfMessage(2)
+        >> RequestEndOfMessage(3)
+        << Log(
+            "Race group 'coupons' cannot be released in one write. Releasing "
+            "3/3 held members un-raced, 1 still blocked by flow control.",
+            WARNING,
+        )
+        << SendData(tctx.server, released)
+    )
+
+    assert [f.stream_id for f in decode_frames(released())] == [1, 3]
+
+
+def test_a_lost_members_withheld_byte_is_dropped(tctx):
+    """Test that a member that never completes leaves no held byte behind."""
+    playbook, _ = _race_playbook(tctx, RaceGroupSpec("coupons", 2), members=2)
+    rst = hyperframe.frame.RstStreamFrame(stream_id=1)
+    rst.error_code = 8  # CANCEL
+
+    assert (
+        playbook
+        >> RequestData(1, b"hello")
+        << SendData(tctx.server, Placeholder(bytes))
+        >> DataReceived(tctx.server, rst.serialize())
+        << ReceiveHttp(Placeholder(ResponseProtocolError))
+        >> RequestEndOfMessage(2)
+        << RequestWakeup(10)
+        << Log(
+            "Race group 'coupons' lost a member. Releasing 1/2 held members "
+            "un-raced, 1 lost to a stream reset.",
+            WARNING,
+        )
+        << SendData(tctx.server, Placeholder(bytes))
+    )
+
+    assert playbook.layer._race_tails == {}
+
+
 def test_race_group_times_out_and_releases_un_raced(tctx):
     """Test that a group missing a member is released normally when the clock runs out."""
     playbook, _ = _race_playbook(tctx, RaceGroupSpec("coupons", 3))
@@ -364,7 +499,7 @@ def test_race_group_fails_when_a_member_is_stuck_behind_flow_control(tctx):
         >> RequestEndOfMessage(3)
         << Log(
             "Race group 'coupons' cannot be released in one write. Releasing "
-            "3/3 held members un-raced, 1 still queued behind flow control.",
+            "3/3 held members un-raced, 1 still blocked by flow control.",
             WARNING,
         )
         << SendData(tctx.server, released)
@@ -610,6 +745,34 @@ def test_a_repeated_completion_is_sent_un_raced(tctx):
         << SendData(tctx.server, sent)
     )
     assert [f.stream_id for f in decode_frames(sent())] == [1]
+
+
+def test_an_un_raced_completion_still_carries_the_withheld_byte(tctx):
+    """Test that degrading to an un-raced send does not truncate the body."""
+    # The withheld byte is the last byte of the request, so whatever path ends the
+    # stream has to send it -- an empty END_STREAM frame would complete the
+    # message a byte short.
+    playbook, _ = _race_playbook(tctx, RaceGroupSpec("coupons", 2), members=2)
+    sent = Placeholder(bytes)
+
+    assert (
+        playbook
+        >> RequestData(1, b"hello")
+        << SendData(tctx.server, Placeholder(bytes))
+        >> RequestEndOfMessage(1)
+        << RequestWakeup(10)
+        >> RequestEndOfMessage(1)
+        << Log(
+            "Race group: cannot stage stream 1 from staged; sending this request "
+            "un-raced.",
+            WARNING,
+        )
+        << SendData(tctx.server, sent)
+    )
+
+    (frame,) = decode_frames(sent())
+    assert frame.data == b"o"
+    assert "END_STREAM" in frame.flags
 
 
 def test_a_malformed_declaration_is_reported_at_the_stream(tctx):

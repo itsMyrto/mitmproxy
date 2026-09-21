@@ -7,8 +7,8 @@ milliseconds between them, which is usually enough for the server to finish the
 first before the rest arrive.
 
 Marking flows as members of a race group asks mitmproxy to send each request as
-usual but hold back the frame that ends it, until every member is ready. All the
-members are then completed in one write, so the server sees them together.
+usual but hold back its final byte, until every member is ready. All the members
+are then completed in one write, so the server sees them together.
 
 Every member must travel over the same upstream HTTP/2 connection, so they need the
 same destination. Anything that cannot be honoured -- a non-HTTP/2 upstream, a group

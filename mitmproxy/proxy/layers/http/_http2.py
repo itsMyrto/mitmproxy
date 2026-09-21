@@ -1,5 +1,6 @@
 import collections
 import time
+from collections.abc import Iterable
 from collections.abc import Sequence
 from enum import Enum
 from logging import DEBUG
@@ -507,6 +508,8 @@ class Http2Client(Http2Connection):
     """Timestamp of when we've last seen network activity on this connection."""
     _race_deadlines: dict[RequestWakeup, RaceGroup]
     """Live race group deadlines, keyed by the wakeup that will fire them."""
+    _race_tails: dict[int, bytes]
+    """The final body byte withheld from each race member, keyed by stream id."""
 
     def __init__(self, context: Context):
         super().__init__(context, context.server)
@@ -519,6 +522,7 @@ class Http2Client(Http2Connection):
         self.their_stream_id = {}
         self.stream_queue = collections.defaultdict(list)
         self._race_deadlines = {}
+        self._race_tails = {}
 
     def _handle_event(self, event: Event) -> CommandGenerator[None]:
         # We can't reuse stream ids from the client because they may arrived reordered here
@@ -592,22 +596,54 @@ class Http2Client(Http2Connection):
         except RaceGroupError as e:
             yield Log(f"Ignoring race group {spec.id!r}: {e}", WARNING)
 
+    def _blocked_members(self, stream_ids: Iterable[int]) -> list[int]:
+        """List the members whose completion would be buffered instead of written."""
+        blocked = []
+        # local_flow_control_window is per stream, but every withheld byte has to
+        # fit in the one connection window they share, so spend a copy as we go.
+        connection_window = self.h2_conn.outbound_flow_control_window
+        for stream_id in stream_ids:
+            # A stream with data still buffered behind flow control swallows its
+            # completion into that buffer instead of serialising it, which would
+            # drop the member from the release without any error.
+            if (
+                self.h2_conn.stream_buffers.get(stream_id)
+                or stream_id in self.h2_conn.stream_trailers
+            ):
+                blocked.append(stream_id)
+            elif tail := len(self._race_tails.get(stream_id, b"")):
+                # The withheld byte is body data, so unlike the empty END_STREAM
+                # frame it replaces, it needs a window to leave on.
+                window = min(
+                    connection_window,
+                    self.h2_conn.local_flow_control_window(stream_id),
+                )
+                if tail > window:
+                    blocked.append(stream_id)
+                else:
+                    connection_window -= tail
+        return blocked
+
     def race_members_ready(self, group: RaceGroup) -> bool:
         """Check that every member's completion would really go out on the next write."""
-        # A stream with data still buffered behind flow control swallows its
-        # completion into that buffer instead of serialising it, which would
-        # drop the member from the release without any error.
-        return not any(
-            self.h2_conn.stream_buffers.get(stream_id)
-            or stream_id in self.h2_conn.stream_trailers
-            for stream_id in group.members
-        )
+        return not self._blocked_members(group.members)
+
+    def _end_race_member(self, stream_id: int) -> None:
+        """End a member's stream, completing its body with the byte withheld from it."""
+        if tail := self._race_tails.pop(stream_id, b""):
+            self.h2_conn.send_data(stream_id, tail, end_stream=True)
+        else:
+            self.h2_conn.end_stream(stream_id)
 
     def _complete_race_members(self, group: RaceGroup, stream_ids: list[int]) -> None:
         """End the given streams and retire the group."""
         for stream_id in stream_ids:
             if self.is_open_for_us(stream_id):
-                self.h2_conn.end_stream(stream_id)
+                self._end_race_member(stream_id)
+        for stream_id in group.members:
+            # Members left out above -- lost to a stream reset, say -- would
+            # otherwise leave their withheld byte behind.
+            self._race_tails.pop(stream_id, None)
         group.released = True
         self.race_groups.finish(group.id)
         # The deadline entry is deliberately left in place: its wakeup is already
@@ -633,15 +669,10 @@ class Http2Client(Http2Connection):
         lost = sum(1 for state in group.members.values() if state is MemberState.LOST)
         # A member behind flow control is released into its own buffer rather than
         # into this write, so say so instead of implying it went out.
-        queued = sum(
-            1
-            for stream_id in staged
-            if self.h2_conn.stream_buffers.get(stream_id)
-            or stream_id in self.h2_conn.stream_trailers
-        )
+        blocked = len(self._blocked_members(staged))
         detail = f", {lost} lost to a stream reset" if lost else ""
-        if queued:
-            detail += f", {queued} still queued behind flow control"
+        if blocked:
+            detail += f", {blocked} still blocked by flow control"
         yield Log(
             f"Race group {group.id!r} {reason}. Releasing "
             f"{len(staged)}/{group.expected} held members un-raced{detail}.",
@@ -657,7 +688,9 @@ class Http2Client(Http2Connection):
             # Never let bookkeeping take the connection down: send it un-raced.
             yield Log(f"Race group: {e}; sending this request un-raced.", WARNING)
             if self.is_open_for_us(stream_id):
-                self.h2_conn.end_stream(stream_id)
+                # Still by way of the withheld byte: an empty END_STREAM frame
+                # here would complete the message a byte short.
+                self._end_race_member(stream_id)
             return
         if not any(live is group for live in self._race_deadlines.values()):
             # The clock starts when we first hold something back. Counting staged
@@ -728,6 +761,20 @@ class Http2Client(Http2Connection):
             )
             self.streams[event.stream_id] = StreamState.EXPECTING_HEADERS
             yield from self._flush()
+        elif (
+            isinstance(event, RequestData)
+            and self.race_groups.group_for(event.stream_id) is not None
+        ):
+            # Withholding only the empty END_STREAM frame is not enough: a server
+            # that decides a message is complete from content-length rather than
+            # from END_STREAM starts work the moment the last body byte lands,
+            # which is the very thing the group exists to synchronise. So the
+            # final byte is what we hold back, and the release carries it.
+            pending = self._race_tails.pop(event.stream_id, b"") + event.data
+            self._race_tails[event.stream_id] = pending[-1:]
+            event.data = pending[:-1]
+            if event.data:
+                yield from super()._handle_event(event)
         elif (
             isinstance(event, RequestEndOfMessage)
             and self.is_open_for_us(event.stream_id)
