@@ -145,7 +145,7 @@ class Options(optmanager.OptManager):
             """,
         )
         self.add_option(
-            "race_group_timeout",
+            "http2_race_group_timeout",
             int,
             10,
             """

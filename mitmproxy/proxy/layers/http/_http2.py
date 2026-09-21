@@ -695,7 +695,7 @@ class Http2Client(Http2Connection):
         if not any(live is group for live in self._race_deadlines.values()):
             # The clock starts when we first hold something back. Counting staged
             # members would restart it whenever one is lost, arming a second one.
-            timeout = self.context.options.race_group_timeout
+            timeout = self.context.options.http2_race_group_timeout
             if timeout > 0:
                 wakeup = RequestWakeup(timeout)
                 self._race_deadlines[wakeup] = group
@@ -716,7 +716,7 @@ class Http2Client(Http2Connection):
             if not group.released:
                 yield from self.fail_race_group(
                     group,
-                    f"timed out after {self.context.options.race_group_timeout}s -- "
+                    f"timed out after {self.context.options.http2_race_group_timeout}s -- "
                     f"the rest either never arrived or went to another connection",
                 )
                 yield from self._flush()

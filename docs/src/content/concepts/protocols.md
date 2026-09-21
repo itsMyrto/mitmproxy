@@ -58,7 +58,7 @@ Requests that carry trailers or that are being streamed cannot take part. Anythi
 cannot be honoured is logged and the request is sent normally, so a declaration never
 changes whether a request is delivered -- only when it completes.
 
-If a group is still incomplete after `race_group_timeout` seconds (10 by default), the
+If a group is still incomplete after `http2_race_group_timeout` seconds (10 by default), the
 members held so far are sent without being raced.
 
 ##### Known Limitations

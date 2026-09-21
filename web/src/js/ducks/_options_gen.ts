@@ -27,6 +27,7 @@ export interface OptionsState {
     hardump: string;
     http2: boolean;
     http2_ping_keepalive: number;
+    http2_race_group_timeout: number;
     http3: boolean;
     http_connect_send_host_header: boolean;
     ignore_hosts: string[];
@@ -48,7 +49,6 @@ export interface OptionsState {
     protobuf_definitions: string | undefined;
     proxy_debug: boolean;
     proxyauth: string | undefined;
-    race_group_timeout: number;
     rawtcp: boolean;
     readfile_filter: string | undefined;
     request_client_cert: boolean;
@@ -136,6 +136,7 @@ export const defaultState: OptionsState = {
     hardump: "",
     http2: true,
     http2_ping_keepalive: 58,
+    http2_race_group_timeout: 10,
     http3: true,
     http_connect_send_host_header: true,
     ignore_hosts: [],
@@ -157,7 +158,6 @@ export const defaultState: OptionsState = {
     protobuf_definitions: undefined,
     proxy_debug: false,
     proxyauth: undefined,
-    race_group_timeout: 10,
     rawtcp: true,
     readfile_filter: undefined,
     request_client_cert: false,
